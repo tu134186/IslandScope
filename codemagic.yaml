@@ -1,0 +1,242 @@
+workflows:
+  buildmate-clean-v1:
+    name: BuildMate Clean · IPA / DEB
+    instance_type: mac_mini_m2
+    max_build_duration: 35
+
+    environment:
+      groups:
+        - buildmate_secrets
+      xcode: 16.4
+
+    scripts:
+      - name: 1. 检查源码 ZIP
+        script: |
+          set -euo pipefail
+          cd "$CM_BUILD_DIR"
+          test -f app.zip || { echo "❌ 仓库根目录没有 app.zip"; exit 1; }
+          echo "app.zip SHA-256: $(shasum -a 256 app.zip | awk '{print $1}')"
+          echo "app.zip bytes: $(wc -c < app.zip | tr -d ' ')"
+          unzip -tq app.zip
+          echo "✅ ZIP 完整"
+
+      - name: 2. 解压并识别当前工程
+        script: |
+          set -euo pipefail
+          cd "$CM_BUILD_DIR"
+          rm -rf src .bm-unpack
+          mkdir -p src .bm-unpack
+          unzip -q app.zip -d src
+
+          # 允许 ZIP 外面多包一层目录；找到真正工程根后提升到 src/。
+          if [ ! -f src/project.yml ] && [ ! -f src/Makefile ]; then
+            ROOT_FILE="$(find src -type f \( -name project.yml -o -name Makefile \) | head -1 || true)"
+            test -n "$ROOT_FILE" || { echo "❌ 解压后找不到 project.yml 或 Makefile"; exit 1; }
+            ROOT="$(dirname "$ROOT_FILE")"
+            cp -R "$ROOT"/. .bm-unpack/
+            rm -rf src
+            mv .bm-unpack src
+          fi
+
+          if [ -f src/Makefile ] && { [ -f src/control ] || [ -f src/layout/DEBIAN/control ] || grep -q 'THEOS' src/Makefile; }; then
+            echo theos > src/.buildmate_project_type
+            echo "✅ 检测到 Theos/DEB 工程"
+          elif [ -f src/project.yml ]; then
+            echo xcodegen > src/.buildmate_project_type
+            test -d src/BuildMate || { echo "❌ BuildMate 源码目录不存在"; exit 1; }
+            SWIFT_COUNT="$(find src/BuildMate -type f -name '*.swift' | wc -l | tr -d ' ')"
+            test "${SWIFT_COUNT:-0}" -gt 0 || { echo "❌ 没有 Swift 源文件"; exit 1; }
+            echo "===== project.yml ====="
+            cat src/project.yml
+            echo "Swift 文件数: $SWIFT_COUNT"
+            if [ -f src/scripts/check_release_version.py ]; then
+              echo "===== 版本一致性 ====="
+              (cd src && python3 scripts/check_release_version.py)
+            fi
+            echo "✅ 检测到 XcodeGen/IPA 工程"
+          else
+            echo "❌ 无法识别当前源码为 XcodeGen 或 Theos 工程"
+            exit 1
+          fi
+
+      - name: 3. 准备真实编译环境
+        script: |
+          set -euo pipefail
+          cd "$CM_BUILD_DIR/src"
+          TYPE="$(cat .buildmate_project_type)"
+
+          if [ "$TYPE" = "theos" ]; then
+            export THEOS="$HOME/theos"
+            if [ ! -d "$THEOS" ]; then
+              git clone --recursive https://github.com/theos/theos.git "$THEOS"
+            fi
+            if ! command -v ldid >/dev/null 2>&1; then
+              brew install ldid
+            fi
+            command -v ldid >/dev/null 2>&1 || { echo "❌ ldid 不可用"; exit 127; }
+            echo "✅ Theos: $THEOS"
+            echo "✅ ldid: $(command -v ldid)"
+          else
+            if ! command -v xcodegen >/dev/null 2>&1; then
+              brew install xcodegen
+            fi
+            xcodegen generate
+            PROJECT="$(find . -maxdepth 1 -type d -name '*.xcodeproj' | head -1 || true)"
+            test -n "$PROJECT" || { echo "❌ XcodeGen 未生成 xcodeproj"; exit 1; }
+            echo "Xcode project: $PROJECT"
+            xcodebuild -project "$PROJECT" -list
+          fi
+
+      - name: 4. 真实编译 IPA / DEB
+        script: |
+          set -euo pipefail
+          set -o pipefail
+          cd "$CM_BUILD_DIR/src"
+          TYPE="$(cat .buildmate_project_type)"
+          rm -rf build Payload compile.log compile-errors.txt packages ./*.ipa
+
+          if [ "$TYPE" = "theos" ]; then
+            export THEOS="$HOME/theos"
+            set +e
+            make clean package FINALPACKAGE=1 messages=yes 2>&1 | tee compile.log
+            STATUS=${PIPESTATUS[0]}
+            set -e
+            if [ "$STATUS" -ne 0 ]; then
+              grep -n -B 3 -A 8 -E 'error:|fatal error:|Undefined symbols|ld:|logos|make\[[0-9]+\]: \*\*\*' compile.log | tail -400 > compile-errors.txt || true
+              if [ ! -s compile-errors.txt ]; then tail -300 compile.log > compile-errors.txt || true; fi
+              echo "❌ Theos 编译失败；真实错误已保存 compile-errors.txt"
+              exit "$STATUS"
+            fi
+            DEB="$(find packages -type f -name '*.deb' | head -1 || true)"
+            test -n "$DEB" || { echo "❌ Theos 编译完成但没有生成 DEB"; exit 1; }
+            test -s "$DEB" || { echo "❌ DEB 为空"; exit 1; }
+            echo "✅ DEB: $DEB"
+          else
+            PROJECT="$(find . -maxdepth 1 -type d -name '*.xcodeproj' | head -1 || true)"
+            test -n "$PROJECT" || { echo "❌ 找不到 xcodeproj"; exit 1; }
+            SCHEME="$(xcodebuild -project "$PROJECT" -list -json | python3 -c 'import json,sys; d=json.load(sys.stdin); s=d.get("project",{}).get("schemes",[]); print(s[0] if s else "")')"
+            test -n "$SCHEME" || { echo "❌ 找不到 Scheme"; exit 1; }
+            echo "Project: $PROJECT"
+            echo "Scheme: $SCHEME"
+            xcodebuild -version
+            set +e
+            xcodebuild \
+              -project "$PROJECT" \
+              -scheme "$SCHEME" \
+              -configuration Release \
+              -sdk iphoneos \
+              -derivedDataPath build \
+              CODE_SIGNING_ALLOWED=NO \
+              CODE_SIGNING_REQUIRED=NO \
+              CODE_SIGN_IDENTITY='' \
+              build 2>&1 | tee compile.log
+            STATUS=${PIPESTATUS[0]}
+            set -e
+            if [ "$STATUS" -ne 0 ]; then
+              grep -n -B 3 -A 8 -E 'error:|fatal error:|SwiftCompile|CompileSwift|EmitSwiftModule|Command .* failed' compile.log | tail -400 > compile-errors.txt || true
+              if [ ! -s compile-errors.txt ]; then tail -300 compile.log > compile-errors.txt || true; fi
+              echo "❌ Xcode 编译失败；真实错误已保存 compile-errors.txt"
+              exit "$STATUS"
+            fi
+            APP="$(find build/Build/Products/Release-iphoneos -maxdepth 1 -type d -name '*.app' | head -1 || true)"
+            test -n "$APP" || { echo "❌ 编译成功但找不到 .app"; exit 1; }
+            EXEC="$(basename "$APP" .app)"
+            VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist" 2>/dev/null || echo unknown)"
+            BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP/Info.plist" 2>/dev/null || echo unknown)"
+            IPA="${EXEC}-V${VERSION}-Build${BUILD}-Codemagic.ipa"
+            mkdir Payload
+            cp -R "$APP" Payload/
+            zip -qry "$IPA" Payload
+            test -s "$IPA" || { echo "❌ IPA 打包失败"; exit 1; }
+            echo "✅ IPA: $IPA"
+          fi
+
+    artifacts:
+      - src/*.ipa
+      - src/packages/*.deb
+      - src/compile.log
+      - src/compile-errors.txt
+    publishing:
+      scripts:
+        - name: 5. Artifact Return Bridge · IPA / DEB
+          script: |
+            set -euo pipefail
+            cd "$CM_BUILD_DIR"
+
+            # Codemagic 官方 publishing 阶段：CM_ARTIFACT_LINKS 此时才是最终产物清单。
+            # BuildMate Relay 只负责把本次 Task 的真实成品 + receipt 写到任务专属分支，
+            # 不参与调度、不触发新 Build、不包含任何 Token。
+            TASK_ID="${BM_TASK_ID:-}"
+            RELAY_REPO="${BM_RELAY_REPO:-}"
+            RELAY_BRANCH="${BM_RELAY_BRANCH:-}"
+            RELAY_RECEIPT="${BM_RELAY_PATH:-}"
+            RELAY_TOKEN="${BUILDMATE_RELAY_GITHUB_TOKEN:-}"
+
+            if [ -z "$TASK_ID" ]; then
+              echo "BUILDMATE_ARTIFACT_RELAY_SKIP: missing BM_TASK_ID"
+              exit 0
+            fi
+            [ -n "$RELAY_BRANCH" ] || RELAY_BRANCH="buildmate-relay/$(printf '%s' "$TASK_ID" | tr '[:upper:]' '[:lower:]')"
+            [ -n "$RELAY_RECEIPT" ] || RELAY_RECEIPT=".buildmate/relay/${TASK_ID}/artifact-return-receipt.json"
+
+            ARTIFACT="$(find "$CM_BUILD_DIR/src" -type f \( -name '*.ipa' -o -name '*.deb' \) | head -1 || true)"
+            if [ -z "$ARTIFACT" ] || [ ! -s "$ARTIFACT" ]; then
+              echo "BUILDMATE_ARTIFACT_RELAY_SKIP: no IPA/DEB artifact"
+              exit 0
+            fi
+
+            NAME="$(basename "$ARTIFACT")"
+            case "${NAME##*.}" in
+              deb|DEB) KIND="DEB" ;;
+              *) KIND="IPA" ;;
+            esac
+            BYTES="$(wc -c < "$ARTIFACT" | tr -d ' ')"
+            SHA256="$(shasum -a 256 "$ARTIFACT" | awk '{print $1}')"
+            EXT="$(printf '%s' "${NAME##*.}" | tr '[:upper:]' '[:lower:]')"
+            RELAY_DIR="$(dirname "$RELAY_RECEIPT")"
+            RELAY_ARTIFACT="${RELAY_DIR}/artifact.${EXT}"
+            LINKS_FILE="$CM_BUILD_DIR/.codemagic-artifact-links.txt"
+            printf '%s' "${CM_ARTIFACT_LINKS:-}" > "$LINKS_FILE"
+
+            RECEIPT_TMP="$CM_BUILD_DIR/artifact-return-receipt.json"
+            python3 - "$RECEIPT_TMP" "$TASK_ID" "${CM_BUILD_ID:-}" "${BM_SOURCE_SHA256:-}" "$KIND" "$NAME" "$RELAY_BRANCH" "$RELAY_ARTIFACT" "$BYTES" "$SHA256" "$LINKS_FILE" <<'PYRECEIPT'
+            import json,sys,datetime
+            out,task,build,source,kind,name,branch,path,bytes_,sha,links_file=sys.argv[1:]
+            try:
+                links=open(links_file,'r',encoding='utf-8').read()
+            except Exception:
+                links=''
+            obj={
+              "schema":2, "taskID":task, "buildID":build, "sourceSHA256":source,
+              "artifactKind":kind, "artifactName":name, "artifactPath":path,
+              "relayBranch":branch, "byteCount":int(bytes_), "sha256":sha,
+              "codemagicArtifactLinksAvailable":bool(links.strip()),
+              "createdAt":datetime.datetime.now(datetime.timezone.utc).isoformat()
+            }
+            with open(out,'w',encoding='utf-8') as f: json.dump(obj,f,ensure_ascii=False,indent=2)
+            PYRECEIPT
+
+            mkdir -p "$CM_EXPORT_DIR"
+            cp "$RECEIPT_TMP" "$CM_EXPORT_DIR/artifact-return-receipt.json"
+            echo "BUILDMATE_ARTIFACT_READY: kind=$KIND name=$NAME bytes=$BYTES sha256=${SHA256:0:12}..."
+            echo "BUILDMATE_ARTIFACT_LINKS_READY: $([ -s "$LINKS_FILE" ] && echo yes || echo no)"
+
+            if [ -z "$RELAY_TOKEN" ] || [ -z "$RELAY_REPO" ]; then
+              echo "BUILDMATE_ARTIFACT_RELAY_SKIP: missing relay secret/repo; receipt exported only"
+              exit 0
+            fi
+
+            TMP="$(mktemp -d)"
+            trap 'rm -rf "$TMP"' EXIT
+            git -C "$TMP" init -q
+            git -C "$TMP" config user.name "BuildMate Artifact Relay"
+            git -C "$TMP" config user.email "buildmate-relay@users.noreply.github.com"
+            git -C "$TMP" checkout --orphan "$RELAY_BRANCH" >/dev/null 2>&1
+            mkdir -p "$TMP/$RELAY_DIR"
+            cp "$ARTIFACT" "$TMP/$RELAY_ARTIFACT"
+            cp "$RECEIPT_TMP" "$TMP/$RELAY_RECEIPT"
+            git -C "$TMP" add "$RELAY_ARTIFACT" "$RELAY_RECEIPT"
+            git -C "$TMP" commit -q -m "BuildMate artifact return $TASK_ID"
+            AUTH="$(printf 'x-access-token:%s' "$RELAY_TOKEN" | base64 | tr -d '\n')"
+            git -C "$TMP" -c http.extraHeader="Authorization: Basic $AUTH" push -q --force "https://github.com/${RELAY_REPO}.git" "HEAD:refs/heads/$RELAY_BRANCH"
+            echo "BUILDMATE_ARTIFACT_RELAY_OK: branch=$RELAY_BRANCH receipt=$RELAY_RECEIPT artifact=$RELAY_ARTIFACT"
